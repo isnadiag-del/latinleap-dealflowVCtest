@@ -1,0 +1,64 @@
+{
+  "name": "Latin Leap — Apify Scraping Steps",
+  "description": "Add these steps to your Pipedream workflow BEFORE merge_sources. Each step scrapes a different source.",
+  "steps": [
+    {
+      "id": "fetch_yc",
+      "source": "Y Combinator",
+      "cost": "free",
+      "type": "code",
+      "lang": "nodejs",
+      "note": "Scrape YC companies via Apify actor. Apify Actor: https://apify.com/epctex/y-combinator-scraper",
+      "code": "import axios from 'axios';\n\nexport default defineComponent({\n  props: {\n    apify_token: { type: 'string', secret: true, label: 'Apify API Token' }\n  },\n  async run({ steps, $ }) {\n    // Run actor\n    const run = await axios.post(\n      'https://api.apify.com/v2/acts/epctex~y-combinator-scraper/runs',\n      { batches: ['W25', 'S24', 'W24'], maxItems: 30 },\n      { headers: { Authorization: `Bearer ${this.apify_token}` } }\n    );\n    const runId = run.data.data.id;\n\n    // Wait for finish (max 60s)\n    let status = 'RUNNING';\n    for (let i = 0; i < 12; i++) {\n      await new Promise(r => setTimeout(r, 5000));\n      const s = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}`, {\n        headers: { Authorization: `Bearer ${this.apify_token}` }\n      });\n      status = s.data.data.status;\n      if (status === 'SUCCEEDED') break;\n    }\n\n    // Get results\n    const results = await axios.get(\n      `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?limit=30`,\n      { headers: { Authorization: `Bearer ${this.apify_token}` } }\n    );\n\n    return (results.data || []).map(c => ({\n      company: c.name || c.company_name,\n      desc: c.one_liner || c.short_description || '',\n      source: 'YC',\n      country: c.country || 'US',\n      stage: 'Pre-seed',\n      capital: 'USD 500K',\n      website: c.website || '',\n    })).filter(c => c.company);\n  }\n});"
+    },
+    {
+      "id": "fetch_linkedin",
+      "source": "LinkedIn",
+      "cost": "~$5 USD / 1000 results en Apify",
+      "type": "code",
+      "lang": "nodejs",
+      "note": "Scrape LinkedIn company search for LATAM startups. Apify Actor: https://apify.com/curious_coder/linkedin-company-search-scraper",
+      "code": "import axios from 'axios';\n\nexport default defineComponent({\n  props: {\n    apify_token: { type: 'string', secret: true, label: 'Apify API Token' }\n  },\n  async run({ steps, $ }) {\n    const searches = [\n      'fintech startup Mexico seed',\n      'startup Colombia pre-seed 2024',\n      'startup Chile seed round',\n      'startup Peru pre-seed',\n    ];\n\n    const allResults = [];\n\n    for (const keyword of searches) {\n      try {\n        const run = await axios.post(\n          'https://api.apify.com/v2/acts/curious_coder~linkedin-company-search-scraper/runs',\n          { keyword, maxResults: 10 },\n          { headers: { Authorization: `Bearer ${this.apify_token}` } }\n        );\n        const runId = run.data.data.id;\n\n        // Wait\n        for (let i = 0; i < 10; i++) {\n          await new Promise(r => setTimeout(r, 5000));\n          const s = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}`,\n            { headers: { Authorization: `Bearer ${this.apify_token}` } }\n          );\n          if (s.data.data.status === 'SUCCEEDED') break;\n        }\n\n        const res = await axios.get(\n          `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?limit=10`,\n          { headers: { Authorization: `Bearer ${this.apify_token}` } }\n        );\n\n        const mapped = (res.data || []).map(c => ({\n          company: c.name || c.companyName,\n          desc: c.description || c.tagline || c.specialties || '',\n          source: 'LinkedIn',\n          country: c.headquarter?.country || 'LATAM',\n          stage: 'Pre-seed',\n          capital: 'USD 500K',\n          website: c.websiteUrl || '',\n        })).filter(c => c.company && c.desc);\n\n        allResults.push(...mapped);\n        await new Promise(r => setTimeout(r, 2000));\n      } catch(e) {\n        console.log(`LinkedIn search failed for: ${keyword}`, e.message);\n      }\n    }\n\n    console.log(`LinkedIn: found ${allResults.length} startups`);\n    return allResults;\n  }\n});"
+    },
+    {
+      "id": "fetch_500latam",
+      "source": "500 LATAM / Aceleradoras",
+      "cost": "free (web scraping publico)",
+      "type": "code",
+      "lang": "nodejs",
+      "note": "Scrape public accelerator portfolios. Apify Actor: https://apify.com/apify/web-scraper",
+      "code": "import axios from 'axios';\n\nexport default defineComponent({\n  props: {\n    apify_token: { type: 'string', secret: true, label: 'Apify API Token' }\n  },\n  async run({ steps, $ }) {\n    const sources = [\n      { url: 'https://500.co/companies', selector: '.company-card', source: '500 LATAM' },\n      { url: 'https://www.startupchile.org/companies', selector: '.company-item', source: 'Startup Chile' },\n      { url: 'https://endeavor.org/entrepreneurs/', selector: '.entrepreneur-card', source: 'Endeavor' },\n    ];\n\n    const allResults = [];\n\n    for (const src of sources) {\n      try {\n        const run = await axios.post(\n          'https://api.apify.com/v2/acts/apify~web-scraper/runs',\n          {\n            startUrls: [{ url: src.url }],\n            pageFunction: `async function pageFunction(context) {\n              const { $, request } = context;\n              const companies = [];\n              $('${src.selector}').each((i, el) => {\n                const name = $(el).find('h2, h3, .name, .title').first().text().trim();\n                const desc = $(el).find('p, .description, .bio').first().text().trim();\n                if (name) companies.push({ name, desc, url: $(el).find('a').attr('href') || '' });\n              });\n              return companies;\n            }`,\n            maxPagesPerCrawl: 1,\n          },\n          { headers: { Authorization: `Bearer ${this.apify_token}` } }\n        );\n        const runId = run.data.data.id;\n\n        for (let i = 0; i < 12; i++) {\n          await new Promise(r => setTimeout(r, 5000));\n          const s = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}`,\n            { headers: { Authorization: `Bearer ${this.apify_token}` } }\n          );\n          if (s.data.data.status === 'SUCCEEDED') break;\n        }\n\n        const res = await axios.get(\n          `https://api.apify.com/v2/actor-runs/${runId}/dataset/items`,\n          { headers: { Authorization: `Bearer ${this.apify_token}` } }\n        );\n\n        const flat = (res.data || []).flat().map(c => ({\n          company: c.name,\n          desc: c.desc || '',\n          source: src.source,\n          country: 'LATAM',\n          stage: 'Seed',\n          capital: 'USD 1M',\n          website: c.url || '',\n        })).filter(c => c.company);\n\n        allResults.push(...flat);\n      } catch(e) {\n        console.log(`Failed scraping ${src.source}:`, e.message);\n      }\n    }\n\n    console.log(`Aceleradoras: found ${allResults.length} startups`);\n    return allResults;\n  }\n});"
+    },
+    {
+      "id": "fetch_crunchbase",
+      "source": "Crunchbase",
+      "cost": "requiere plan Crunchbase Pro (~$29/mes) o Apify actor",
+      "type": "code",
+      "lang": "nodejs",
+      "note": "Scrape Crunchbase for recent LATAM funding rounds. Apify Actor: https://apify.com/ontopo/crunchbase-companies-scraper",
+      "code": "import axios from 'axios';\n\nexport default defineComponent({\n  props: {\n    apify_token: { type: 'string', secret: true, label: 'Apify API Token' }\n  },\n  async run({ steps, $ }) {\n    try {\n      const run = await axios.post(\n        'https://api.apify.com/v2/acts/ontopo~crunchbase-companies-scraper/runs',\n        {\n          searchQueries: ['fintech LATAM seed', 'startup Mexico Colombia Chile pre-seed'],\n          maxItems: 20,\n          fundingStages: ['pre_seed', 'seed'],\n          locations: ['Mexico', 'Colombia', 'Chile', 'Peru', 'Argentina'],\n        },\n        { headers: { Authorization: `Bearer ${this.apify_token}` } }\n      );\n      const runId = run.data.data.id;\n\n      for (let i = 0; i < 12; i++) {\n        await new Promise(r => setTimeout(r, 5000));\n        const s = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}`,\n          { headers: { Authorization: `Bearer ${this.apify_token}` } }\n        );\n        if (s.data.data.status === 'SUCCEEDED') break;\n      }\n\n      const res = await axios.get(\n        `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?limit=20`,\n        { headers: { Authorization: `Bearer ${this.apify_token}` } }\n      );\n\n      return (res.data || []).map(c => ({\n        company: c.name || c.company_name,\n        desc: c.short_description || c.description || '',\n        source: 'Crunchbase',\n        country: c.country_code || c.location || 'LATAM',\n        stage: c.last_funding_type || 'Seed',\n        capital: c.last_funding_amount ? `USD ${c.last_funding_amount}` : 'USD 1M',\n        website: c.homepage_url || '',\n      })).filter(c => c.company && c.desc);\n    } catch(e) {\n      console.log('Crunchbase scraping failed:', e.message);\n      return [];\n    }\n  }\n});"
+    },
+    {
+      "id": "merge_sources",
+      "source": "Merge all",
+      "type": "code",
+      "lang": "nodejs",
+      "note": "Replace your existing merge_sources step with this one",
+      "code": "export default defineComponent({\n  async run({ steps, $ }) {\n    const yc   = steps.fetch_yc.$return_value || [];\n    const li   = steps.fetch_linkedin.$return_value || [];\n    const acc  = steps.fetch_500latam.$return_value || [];\n    const cb   = steps.fetch_crunchbase.$return_value || [];\n\n    const all = [...yc, ...li, ...acc, ...cb];\n\n    // Deduplicate by company name\n    const seen = new Set();\n    const unique = all.filter(s => {\n      const key = s.company?.toLowerCase().trim();\n      if (!key || seen.has(key)) return false;\n      seen.add(key);\n      return true;\n    });\n\n    console.log(`Sources: YC=${yc.length} LinkedIn=${li.length} Aceleradoras=${acc.length} Crunchbase=${cb.length}`);\n    console.log(`Total unique startups: ${unique.length}`);\n    return unique;\n  }\n});"
+    }
+  ],
+  "setup": {
+    "1_apify_account": "Crea cuenta en apify.com (free tier incluye $5 creditos/mes)",
+    "2_apify_token": "En Apify: Settings > Integrations > API Token — copialo",
+    "3_add_secret": "En Pipedream agrega secret: apify_token con tu token de Apify",
+    "4_replace_steps": "Reemplaza fetch_yc y merge_sources de tu workflow anterior con estos pasos nuevos",
+    "5_add_steps": "Agrega fetch_linkedin, fetch_500latam, fetch_crunchbase como steps nuevos antes de merge_sources",
+    "6_order": "Orden correcto: fetch_yc > fetch_linkedin > fetch_500latam > fetch_crunchbase > merge_sources > score_with_claude > filter_by_threshold > send_telegram",
+    "costs": {
+      "apify_free_tier": "$5 USD creditos/mes — suficiente para ~500 scrapes diarios",
+      "linkedin_scraping": "~$0.005 por resultado — 40 resultados/dia = $0.20/dia",
+      "yc_crunchbase": "gratis o muy barato",
+      "total_estimated": "< $10 USD/mes para el pipeline completo"
+    }
+  }
+}

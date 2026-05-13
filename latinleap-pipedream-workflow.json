@@ -1,0 +1,67 @@
+{
+  "name": "Latin Leap Dealflow Automator",
+  "description": "Scrapes LATAM startup sources, scores with Claude API, notifies Telegram if score >= threshold",
+  "version": "1.0.0",
+  "trigger": {
+    "type": "cron",
+    "cron": "0 9 * * 1-5",
+    "timezone": "America/Bogota",
+    "description": "Runs every weekday at 9am Bogota time"
+  },
+  "steps": [
+    {
+      "id": "trigger",
+      "type": "cron_trigger",
+      "note": "Runs Mon-Fri at 9am. Change cron expression to adjust schedule."
+    },
+    {
+      "id": "fetch_yc",
+      "type": "code",
+      "lang": "nodejs",
+      "note": "Fetch recent YC companies from public API",
+      "code": "import axios from 'axios';\n\nexport default defineComponent({\n  async run({ steps, $ }) {\n    const res = await axios.get('https://api.ycombinator.com/v0.1/companies?batch=W25&batch=S24', {\n      headers: { 'Accept': 'application/json' }\n    });\n    const companies = (res.data.companies || []).slice(0, 10).map(c => ({\n      company: c.name,\n      desc: c.one_liner || c.long_description?.slice(0, 150) || '',\n      source: 'YC',\n      country: c.country || 'US',\n      stage: 'Pre-seed',\n      capital: 'USD 500K',\n      website: c.website,\n    }));\n    return companies;\n  }\n});"
+    },
+    {
+      "id": "fetch_producthunt",
+      "type": "code",
+      "lang": "nodejs",
+      "note": "Fetch trending startups from Product Hunt (LATAM filter)",
+      "code": "import axios from 'axios';\n\nexport default defineComponent({\n  async run({ steps, $ }) {\n    const query = `{\n      posts(first: 20, topic: \"fintech\") {\n        edges {\n          node {\n            name\n            tagline\n            website\n            votesCount\n          }\n        }\n      }\n    }`;\n    try {\n      const res = await axios.post('https://api.producthunt.com/v2/api/graphql',\n        { query },\n        { headers: { 'Authorization': 'Bearer YOUR_PH_TOKEN', 'Content-Type': 'application/json' } }\n      );\n      return (res.data?.data?.posts?.edges || []).map(e => ({\n        company: e.node.name,\n        desc: e.node.tagline,\n        source: 'ProductHunt',\n        country: 'MX',\n        stage: 'Pre-seed',\n        capital: 'USD 300K',\n        website: e.node.website,\n      }));\n    } catch {\n      return [];\n    }\n  }\n});"
+    },
+    {
+      "id": "merge_sources",
+      "type": "code",
+      "lang": "nodejs",
+      "note": "Merge all sources into one list",
+      "code": "export default defineComponent({\n  async run({ steps, $ }) {\n    const yc = steps.fetch_yc.$return_value || [];\n    const ph = steps.fetch_producthunt.$return_value || [];\n    const all = [...yc, ...ph];\n    console.log(`Total startups to analyze: ${all.length}`);\n    return all;\n  }\n});"
+    },
+    {
+      "id": "score_with_claude",
+      "type": "code",
+      "lang": "nodejs",
+      "note": "Score each startup with Claude API",
+      "code": "import axios from 'axios';\n\nconst SYSTEM = `Eres el motor de scoring de dealflow para Latin Leap, fondo de USD 20M enfocado en startups pre-seed y seed de LATAM hispanohablante.\n\nResponde SOLO con JSON sin markdown:\n{\"geography\":0,\"sector\":0,\"traction\":0,\"market_size\":0,\"team\":0,\"stage\":\"Pre-seed\",\"capital\":\"USD XK\",\"country\":\"XX\",\"verdict\":\"\"}\n\nScores 1-10:\n- geography: 10 = opera en LATAM hispanohablante\n- sector: 10 = tech con alto potencial en LATAM  \n- traction: 10 = traccion clara y medible\n- market_size: 10 = mercado enorme y validado\n- team: 10 = founders excepcionales con track record\n- verdict: STRONG FIT / WATCH / PASS`;\n\nexport default defineComponent({\n  props: {\n    anthropic_api_key: { type: 'string', secret: true, label: 'Anthropic API Key' }\n  },\n  async run({ steps, $ }) {\n    const startups = steps.merge_sources.$return_value || [];\n    const scored = [];\n\n    for (const s of startups) {\n      try {\n        const res = await axios.post(\n          'https://api.anthropic.com/v1/messages',\n          {\n            model: 'claude-haiku-4-5-20251001',\n            max_tokens: 300,\n            system: SYSTEM,\n            messages: [{ role: 'user', content: `Analiza: ${s.company} - ${s.desc} - País: ${s.country}` }]\n          },\n          { headers: { 'x-api-key': this.anthropic_api_key, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' } }\n        );\n        const txt = res.data.content[0].text.replace(/```json|```/g, '').trim();\n        const scores = JSON.parse(txt);\n        const total = Math.round(\n          scores.geography * 0.20 * 10 +\n          scores.sector     * 0.20 * 10 +\n          scores.traction   * 0.25 * 10 +\n          scores.market_size* 0.20 * 10 +\n          scores.team       * 0.15 * 10\n        );\n        scored.push({ ...s, scores, total, verdict: scores.verdict });\n        await new Promise(r => setTimeout(r, 500));\n      } catch (e) {\n        console.log(`Error scoring ${s.company}:`, e.message);\n      }\n    }\n\n    console.log(`Scored ${scored.length} startups`);\n    return scored;\n  }\n});"
+    },
+    {
+      "id": "filter_by_threshold",
+      "type": "code",
+      "lang": "nodejs",
+      "note": "Filter startups above score threshold",
+      "code": "export default defineComponent({\n  async run({ steps, $ }) {\n    const THRESHOLD = 65;\n    const scored = steps.score_with_claude.$return_value || [];\n    const qualified = scored.filter(s => s.total >= THRESHOLD)\n      .sort((a, b) => b.total - a.total);\n    console.log(`${qualified.length} startups above threshold ${THRESHOLD}`);\n    return { qualified, threshold: THRESHOLD, total_analyzed: scored.length };\n  }\n});"
+    },
+    {
+      "id": "send_telegram",
+      "type": "code",
+      "lang": "nodejs",
+      "note": "Send rich Telegram message with emoji, bullets, and scorecard",
+      "code": "import axios from 'axios';\n\nexport default defineComponent({\n  props: {\n    telegram_bot_token: { type: 'string', secret: true, label: 'Telegram Bot Token' },\n    telegram_chat_id:   { type: 'string', label: 'Telegram Chat ID' }\n  },\n  async run({ steps, $ }) {\n    const token = this.telegram_bot_token;\n    const chat  = this.telegram_chat_id;\n    const { qualified, threshold, total_analyzed } = steps.filter_by_threshold.$return_value;\n    const fecha = new Date().toLocaleDateString('es-CO', { weekday:'long', day:'numeric', month:'long' });\n\n    const send = async (text) => {\n      await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {\n        chat_id: chat, text, parse_mode: 'Markdown'\n      });\n      await new Promise(r => setTimeout(r, 400));\n    };\n\n    const bar = n => {\n      const filled = Math.round(n / 2);\n      return '█'.repeat(filled) + '░'.repeat(5 - filled) + ' ' + n + '/10';\n    };\n\n    const verdict = t => t >= 75 ? { t: 'STRONG FIT', e: '🟢' } : t >= 60 ? { t: 'WATCH', e: '🟡' } : { t: 'PASS', e: '🔴' };\n\n    const FLAGS = { MX:'🇲🇽', CO:'🇨🇴', CL:'🇨🇱', AR:'🇦🇷', PE:'🇵🇪', BR:'🇧🇷', EC:'🇪🇨', UY:'🇺🇾' };\n\n    const SECTORS = {\n      fintech:    ['pago','financi','crédito','banco','neobank','inversión','seguro','impuesto','nómina','tarjeta','bnpl','open banking','token','remesa','factura','conciliaci','scoring','billetera'],\n      healthtech: ['salud','médic','telemedicin','farmacia','clínica','cuidado','mental','odontol','ortodoncia'],\n      proptech:   ['casa','inmueble','apart','arriendo','renta','propiedad','vivienda'],\n      logistics:  ['logístic','carga','envío','transporte','delivery','última milla','freight'],\n      agritech:   ['agro','ganadería','cosecha','agrícola','campo','climático','paramétrico'],\n      'hr & work':['rrhh','nómina','empleado','talento','recursos humanos','beneficio','asistencia'],\n      edtech:     ['educaci','inglés','aprendizaje','learning','universitari','tutor'],\n      legaltech:  ['legal','contrato','trámite','jurídico','vehicular'],\n      'b2b saas': ['software','saas','api','gestión','automatiz','erp','analytics','no-code','crm','pos','facturación','verificaci'],\n      commerce:   ['marketplace','ecommerce','retail','vendedor','tienda','moda','belleza','marca','social commerce','restaurante','loyalty','lealtad','mueble','turismo'],\n    };\n    const getSector = desc => {\n      const d = (desc||'').toLowerCase();\n      for (const [sec, kws] of Object.entries(SECTORS)) {\n        if (kws.some(k => d.includes(k))) return sec.charAt(0).toUpperCase() + sec.slice(1);\n      }\n      return 'Otro';\n    };\n\n    const buildBullets = s => {\n      const b = [];\n      if (s.scores.geography >= 8)   b.push('Opera en mercados core de LATAM hispanohablante con alta densidad de oportunidad');\n      if (s.scores.traction >= 7)    b.push('Señales de tracción tempranas validadas: adopción, revenue o usuarios activos');\n      if (s.scores.market_size >= 8) b.push('Mercado total direccionable grande con múltiples verticales de expansión');\n      if (s.scores.team >= 8)        b.push('Equipo fundador con experiencia relevante y track record en el sector');\n      if (s.scores.sector >= 8)      b.push('Sector con alto potencial de crecimiento y defensibilidad en LATAM');\n      if (b.length < 3)              b.push('Perfil de riesgo consistente con tesis early-stage de Latin Leap');\n      return b.slice(0, 3);\n    };\n\n    const buildMessage = s => {\n      const t  = s.total;\n      const v  = verdict(t);\n      const fl = FLAGS[s.country] || '🌎';\n      const sc = getSector(s.desc);\n      const bullets = buildBullets(s);\n      return [\n        `${v.e} *${s.company}* — ${v.t}`,\n        ``,\n        `${s.desc}`,\n        ``,\n        `📋 *Ficha*`,\n        `${fl} País: ${s.country}   🏷 Sector: ${sc}`,\n        `📌 Stage: ${s.stage}   💰 Capital: ${s.capital}`,\n        `🔗 Fuente: ${s.source}`,\n        s.website ? `🌐 ${s.website}` : null,\n        ``,\n        `💡 *Por qué llama la atención*`,\n        ...bullets.map(b => `• ${b}`),\n        ``,\n        `📊 *Scorecard — ${t}/100*`,\n        `🗺 Geografía   ${bar(s.scores.geography)}`,\n        `⚙️ Sector       ${bar(s.scores.sector)}`,\n        `📈 Traction     ${bar(s.scores.traction)}`,\n        `🏦 Market Size  ${bar(s.scores.market_size)}`,\n        `👥 Team         ${bar(s.scores.team)}`,\n      ].filter(Boolean).join('\\n');\n    };\n\n    if (qualified.length === 0) {\n      await send(`🔍 *Latin Leap Dealflow*\\n${fecha}\\n\\nSe analizaron *${total_analyzed}* startups esta semana. Ninguna superó el umbral mínimo de ${threshold}/100. El pipeline sigue activo para el próximo ciclo.`);\n      return { sent: 0 };\n    }\n\n    const strongFit = qualified.filter(s => s.total >= 75);\n    const watch     = qualified.filter(s => s.total >= 60 && s.total < 75);\n\n    const intro = [\n      `🚀 *Latin Leap Dealflow — ${fecha}*`,\n      ``,\n      `Esta semana el scanner analizó *${total_analyzed} startups* del ecosistema LATAM y encontró *${qualified.length} oportunidades* que superan el umbral de ${threshold}/100.`,\n      strongFit.length > 0 ? `Se identificaron *${strongFit.length} STRONG FIT* listas para primera reunión` + (watch.length > 0 ? ` y *${watch.length} en radar* para seguimiento.` : '.') : `Se identificaron *${watch.length} oportunidades WATCH* para seguimiento cercano.`,\n      ``,\n      `A continuación el detalle de cada deal:`,\n    ].join('\\n');\n\n    await send(intro);\n\n    for (const s of qualified) {\n      await send(buildMessage(s));\n    }\n\n    return { sent: qualified.length };\n  }\n});"
+    }
+  ],
+  "setup_instructions": {
+    "1_import": "En Pipedream ve a Workflows > Import > pega este JSON",
+    "2_secrets": "Configura estos secrets en cada paso: anthropic_api_key (paso score_with_claude), telegram_bot_token y telegram_chat_id (paso send_telegram)",
+    "3_schedule": "El workflow corre automaticamente lunes a viernes a las 9am hora Bogota",
+    "4_threshold": "Cambia THRESHOLD en el paso filter_by_threshold (default: 65)",
+    "5_sources": "Agrega tu token de ProductHunt en fetch_producthunt o conecta Apify para mas fuentes"
+  }
+}
